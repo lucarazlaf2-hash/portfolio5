@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * generate-video-manifest.mjs
- * Scans public/videos recursively and writes src/videoManifest.json.
- * Run via: node scripts/generate-video-manifest.mjs
+ * Scans public/videos recursively and writes src/data/videoManifest.json.
+ * Run manually via: npm run generate:videos
  * No external dependencies.
  */
 
@@ -14,10 +14,21 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const VIDEOS_DIR = path.join(ROOT, 'public', 'videos');
-const THUMBS_DIR = path.join(ROOT, 'public', 'thumbs');
-const MANIFEST_OUT = path.join(ROOT, 'src', 'videoManifest.json');
+const POSTERS_DIR = path.join(ROOT, 'public', 'posters');
+const MANIFEST_OUT = path.join(ROOT, 'src', 'data', 'videoManifest.json');
+const LEGACY_MANIFEST_OUT = path.join(ROOT, 'src', 'videoManifest.json');
 
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.webm']);
+
+// ── Base URL support (e.g. Vercel Blob / Cloudflare R2) ────────────────────
+const RAW_BASE_URL = process.env.VITE_VIDEO_BASE_URL || '';
+const BASE_URL = RAW_BASE_URL.replace(/\/+$/, '');
+
+function buildVideoUrl(relativePath) {
+  const encoded = encodeVideoPath(relativePath);
+  if (!BASE_URL) return encoded;
+  return `${BASE_URL}${encoded.startsWith('/') ? '' : '/'}${encoded}`;
+}
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -43,6 +54,10 @@ function naturalSort(a, b) {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 }
 
+function encodeVideoPath(urlPath) {
+  return urlPath.split('/').map((seg, i) => i === 0 ? seg : encodeURIComponent(seg)).join('/');
+}
+
 // ── ffmpeg / ffprobe detection ───────────────────────────────────────────────
 
 let ffmpegOk = false;
@@ -52,29 +67,35 @@ try {
   execSync('ffmpeg -version', { stdio: 'pipe' });
   ffmpegOk = true;
 } catch {
-  console.warn('\n⚠  ffmpeg not found — poster thumbnails will be null.\n   Install ffmpeg to generate thumbnails automatically.\n');
+  console.warn('\n⚠  ffmpeg not found — will use existing posters in public/posters/ if present.');
 }
 
 try {
   execSync('ffprobe -version', { stdio: 'pipe' });
   ffprobeOk = true;
 } catch {
-  console.warn('⚠  ffprobe not found — video dimensions will be null.\n   Install ffmpeg (includes ffprobe) to get aspect ratios.\n');
+  console.warn('⚠  ffprobe not found — video dimensions will be null (computed at runtime by browser).\n');
 }
 
-// ── thumb generator ─────────────────────────────────────────────────────────
+// ── poster generator ────────────────────────────────────────────────────────
 
 function makePoster(videoPath, slug) {
-  if (!ffmpegOk) return null;
+  const existingRelative = `/posters/${slug}.jpg`;
+  const existingPath = path.join(POSTERS_DIR, `${slug}.jpg`);
+
+  if (!ffmpegOk) {
+    return fs.existsSync(existingPath) ? existingRelative : null;
+  }
+
   try {
-    fs.mkdirSync(THUMBS_DIR, { recursive: true });
-    const outFile = path.join(THUMBS_DIR, `${slug}.jpg`);
+    fs.mkdirSync(POSTERS_DIR, { recursive: true });
     execSync(
-      `ffmpeg -y -ss 0.5 -i "${videoPath}" -vframes 1 -vf "scale=480:-2" "${outFile}"`,
+      `ffmpeg -y -ss 0.5 -i "${videoPath}" -vframes 1 -vf "scale='min(480,iw)':-2" -q:v 4 "${existingPath}"`,
       { stdio: 'pipe' }
     );
-    return `/thumbs/${slug}.jpg`;
+    return existingRelative;
   } catch (err) {
+    if (fs.existsSync(existingPath)) return existingRelative;
     console.warn(`  ⚠  Could not generate thumbnail for ${path.basename(videoPath)}: ${err.message}`);
     return null;
   }
@@ -96,12 +117,10 @@ function getVideoDimensions(videoPath) {
     let w = stream.width;
     let h = stream.height;
 
-    // Check rotation metadata (common in mobile videos)
-    // Try stream tags first
     const rotateTag = stream.tags?.rotate ?? stream.side_data_list?.[0]?.rotation;
     const rotate = rotateTag ? Math.abs(parseInt(rotateTag, 10)) : 0;
     if (rotate === 90 || rotate === 270) {
-      [w, h] = [h, w]; // swap
+      [w, h] = [h, w];
     }
 
     const aspect = w && h ? parseFloat((w / h).toFixed(4)) : null;
@@ -141,10 +160,14 @@ function scanFolder(dir) {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 function buildManifest() {
+  // Fail gracefully if public/videos is missing (e.g. on Vercel / CI builds)
   if (!fs.existsSync(VIDEOS_DIR)) {
-    console.error(`❌  public/videos directory not found at ${VIDEOS_DIR}`);
-    process.exit(1);
+    console.log(`\nℹ️  "public/videos" not found at ${VIDEOS_DIR}.`);
+    console.log(`   Skipping manifest generation. The existing committed manifest will be used.\n`);
+    process.exit(0);
   }
+
+  fs.mkdirSync(POSTERS_DIR, { recursive: true });
 
   const topEntries = fs.readdirSync(VIDEOS_DIR, { withFileTypes: true })
     .filter(e => e.isDirectory())
@@ -172,7 +195,14 @@ function buildManifest() {
         const id = slugify(path.basename(f.name, path.extname(f.name)));
         const poster = makePoster(full, `${folderSlug}--${id}`);
         const dims = getVideoDimensions(full);
-        return { id, title: prettify(path.basename(f.name, path.extname(f.name))), src: `/videos/${folderName}/${f.name}`, type: mimeForExt(f.ext), poster, ...dims };
+        return {
+          id,
+          title: prettify(path.basename(f.name, path.extname(f.name))),
+          src: buildVideoUrl(`/videos/${folderName}/${f.name}`),
+          type: mimeForExt(f.ext),
+          poster,
+          ...dims,
+        };
       });
       heroClips = clips.slice(0, 3);
       continue;
@@ -194,7 +224,7 @@ function buildManifest() {
           return {
             id,
             title: prettify(base),
-            src: encodeVideoPath(`/videos/${folderName}/${subName}/${f.name}`),
+            src: buildVideoUrl(`/videos/${folderName}/${subName}/${f.name}`),
             type: mimeForExt(f.ext),
             poster,
             ...dims,
@@ -214,7 +244,14 @@ function buildManifest() {
         const id = slugify(base);
         const poster = makePoster(full, `hero-${id}`);
         const dims = getVideoDimensions(full);
-        return { id, title: prettify(base), src: encodeVideoPath(`/videos/${folderName}/${f.name}`), type: mimeForExt(f.ext), poster, ...dims };
+        return {
+          id,
+          title: prettify(base),
+          src: buildVideoUrl(`/videos/${folderName}/${f.name}`),
+          type: mimeForExt(f.ext),
+          poster,
+          ...dims,
+        };
       });
     }
   }
@@ -229,7 +266,14 @@ function buildManifest() {
         const id = slugify(base);
         const poster = makePoster(full, `hero-${id}`);
         const dims = getVideoDimensions(full);
-        return { id, title: prettify(base), src: encodeVideoPath(`/videos/${f.name}`), type: mimeForExt(f.ext), poster, ...dims };
+        return {
+          id,
+          title: prettify(base),
+          src: buildVideoUrl(`/videos/${f.name}`),
+          type: mimeForExt(f.ext),
+          poster,
+          ...dims,
+        };
       });
     }
   }
@@ -239,19 +283,19 @@ function buildManifest() {
   }
 
   const manifest = { hero: heroClips ?? [], folders };
+
+  fs.mkdirSync(path.dirname(MANIFEST_OUT), { recursive: true });
   fs.writeFileSync(MANIFEST_OUT, JSON.stringify(manifest, null, 2), 'utf8');
+  fs.writeFileSync(LEGACY_MANIFEST_OUT, JSON.stringify(manifest, null, 2), 'utf8');
 
   const totalClips = folders.reduce((s, f) => s + f.clips.length, 0);
   const movClips = folders.flatMap(f => f.clips).filter(c => c.type === 'video/quicktime');
-  console.log(`\n✅  Manifest written to src/videoManifest.json`);
+  console.log(`\n✅  Manifest written to src/data/videoManifest.json`);
   console.log(`   ${folders.length} folder(s), ${totalClips} clip(s) total`);
-  if (movClips.length) console.log(`   MOV files (${movClips.length}): ${movClips.map(c => c.title).join(', ')}`);
-  console.log(`   ffmpeg: ${ffmpegOk ? 'available ✓' : 'not found ✗'}`);
-  console.log(`   ffprobe (dimensions): ${ffprobeOk ? 'available ✓' : 'not found ✗'}\n`);
-}
-
-function encodeVideoPath(urlPath) {
-  return urlPath.split('/').map((seg, i) => i === 0 ? seg : encodeURIComponent(seg)).join('/');
+  if (BASE_URL) console.log(`   Base URL: ${BASE_URL}`);
+  if (movClips.length) console.log(`   MOV files (${movClips.length})`);
+  console.log(`   ffmpeg: ${ffmpegOk ? 'available ✓' : 'not found'}`);
+  console.log(`   ffprobe: ${ffprobeOk ? 'available ✓' : 'not found'}\n`);
 }
 
 buildManifest();

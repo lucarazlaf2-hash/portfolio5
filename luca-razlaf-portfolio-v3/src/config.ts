@@ -3,7 +3,7 @@
  * Single source of truth. Video data is derived from the auto-generated manifest.
  */
 
-import manifest from './videoManifest.json'
+import manifest from './data/videoManifest.json'
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -24,6 +24,17 @@ export interface Folder {
   clips: Clip[]
 }
 
+// ── base URL resolver (Vite environment variable) ─────────────────────────────
+
+const VIDEO_BASE = (import.meta.env.VITE_VIDEO_BASE_URL || '').replace(/\/+$/, '')
+
+export function resolveVideoUrl(url: string | null | undefined): string {
+  if (!url) return ''
+  if (url.startsWith('http://') || url.startsWith('https://')) return url
+  if (!VIDEO_BASE) return url
+  return `${VIDEO_BASE}${url.startsWith('/') ? '' : '/'}${url}`
+}
+
 // ── derived from manifest ─────────────────────────────────────────────────────
 
 const ART_PRESETS = ['graphite', 'silver', 'obsidian', 'glacier'] as const
@@ -31,7 +42,7 @@ type Art = (typeof ART_PRESETS)[number]
 
 export const HERO: { src: string; type: string; poster: string | null }[] =
   (manifest.hero as unknown as Clip[]).slice(0, 3).map(c => ({
-    src: c.src,
+    src: resolveVideoUrl(c.src),
     type: c.type,
     poster: c.poster,
   }))
@@ -40,6 +51,10 @@ export const FOLDERS: (Folder & { art: Art; seed: number })[] = (
   manifest.folders as unknown as Folder[]
 ).map((f, i) => ({
   ...f,
+  clips: f.clips.map(c => ({
+    ...c,
+    src: resolveVideoUrl(c.src),
+  })),
   art: ART_PRESETS[i % ART_PRESETS.length],
   seed: 7 + i * 5,
 }))
